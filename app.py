@@ -28,24 +28,37 @@ from pathlib import Path
 import gradio as gr
 
 from image_processor import (
+    DEFAULT_OUTPUT_DIR,
     HIGH_BITDEPTH_LABELS,
     RESIZE_MODE_LABELS,
     ChannelError,
     describe_channels,
+    latest_split_dir,
+    list_output_images,
     output_file_name,
     process_channels,
+    prune_split_dirs,
     save_png,
 )
+from ui_tools import build_mosaic_tab, build_splitter_tab
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DEFAULT_SIZE = 1024
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
 # 1:1 细节预览的裁剪边长（原始像素，不缩放）
 DETAIL_SIZE = 256
 
 ALPHA_UPLOAD = "上传 Alpha 图片"
 ALPHA_CONSTANT = "使用常量 Alpha"
+
+# 通道池的列表范围（显示标签, list_output_images 的 scope 值）
+POOL_SCOPE_LATEST = "只列最新一次拆分的通道（推荐）"
+POOL_SCOPE_ALL = "列出 output/ 里全部图片（含历史）"
+POOL_SCOPE_CHOICES = [
+    (POOL_SCOPE_LATEST, "latest_split"),
+    (POOL_SCOPE_ALL, "all"),
+]
 
 # ---------------------------------------------------------------------------
 # 样式
@@ -237,6 +250,52 @@ def detail_preview(image, size=DETAIL_SIZE):
     return image.crop((left, top, left + crop, top + crop))
 
 
+# ---------------------------------------------------------------------------
+# 通道池：把 ③ 拆分出来的单通道灰度图接进 ① 的 R/G/B/A 槽位
+# ---------------------------------------------------------------------------
+
+def channel_pool_choices(scope: str = "latest_split", limit: int = 200):
+    """通道池下拉框的选项：(显示标签, 文件路径)。
+
+    scope="latest_split"（默认）时只列最新一次拆分的四个通道，历史拆分会从列表里消失。
+    """
+    choices = []
+    for entry in list_output_images(OUTPUT_DIR, limit=limit, scope=scope or "latest_split"):
+        kind = "通道" if entry["kind"] == "channel" else "图片"
+        choices.append((
+            f"[{kind}] {entry['label']} · {entry['size'] / 1024:.0f} KB",
+            entry["path"],
+        ))
+    return choices
+
+
+def match_channel_set(output_dir=None):
+    """在归档目录里找最新的一套单通道图（同一目录下的 *_R / *_G / *_B / *_A）。
+
+    Returns:
+        dict，形如 {"R": path, "G": path, "B": path, "A": path}（缺哪个就没哪个键）；
+        找不到返回 {}。
+    """
+    groups: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+
+    for entry in list_output_images(output_dir or OUTPUT_DIR, limit=400, scope="all"):
+        name = Path(entry["path"]).stem
+        if len(name) < 3 or name[-2] != "_" or name[-1].upper() not in ("R", "G", "B", "A"):
+            continue
+        parent = str(Path(entry["path"]).parent)
+        if parent not in groups:
+            groups[parent] = {}
+            order.append(parent)
+        groups[parent].setdefault(name[-1].upper(), entry["path"])
+
+    for parent in order:  # 新的在前
+        found = groups[parent]
+        if len(found) >= 2:
+            return {slot: found[slot] for slot in ("R", "G", "B", "A") if slot in found}
+    return {}
+
+
 def live_preview(
     r_file,
     g_file,
@@ -368,182 +427,222 @@ def build_app() -> gr.Blocks:
             """
         )
 
-        with gr.Row(equal_height=False):
+        with gr.Tabs():
+            with gr.Tab("① 通道合成 · 四通道 → 自定义尺寸"):  # noqa: SIM117 - 显式嵌套更易读
+                with gr.Row(equal_height=False):
 
-            # ============================ 左：输入 & 参数 ============================
-            with gr.Column(scale=4, min_width=420, elem_classes="channel-card"):
+                    # ============================ 左：输入 & 参数 ============================
+                    with gr.Column(scale=4, min_width=420, elem_classes="channel-card"):
 
-                gr.HTML("<div class='section-title'>Input Channels · 输入通道</div>")
-                gr.HTML(
-                    "<div class='status-wait'>未上传的通道按 <b>0</b> 填充："
-                    "R/G/B 记为该颜色分量为 0（黑），A 记为完全透明；"
-                    "四个通道可以只上传其中任意几个。</div>"
-                )
+                        gr.HTML("<div class='section-title'>Input Channels · 输入通道</div>")
+                        gr.HTML(
+                            "<div class='status-wait'>未上传的通道按 <b>0</b> 填充："
+                            "R/G/B 记为该颜色分量为 0（黑），A 记为完全透明；"
+                            "四个通道可以只上传其中任意几个。</div>"
+                        )
 
-                r_input = gr.Image(
-                    label="R · Red 通道",
-                    type="filepath",
-                    # 必须为 None：Gradio 5 默认 "RGB"，会在服务端先把 16-bit 图转成
-                    # 8-bit RGB（>255 直接截断成纯白），原始位深数据就丢失了。
-                    image_mode=None,
-                    sources=["upload", "clipboard"],
-                    height=170,
-                )
-                g_input = gr.Image(
-                    label="G · Green 通道",
-                    type="filepath",
-                    image_mode=None,
-                    sources=["upload", "clipboard"],
-                    height=170,
-                )
-                b_input = gr.Image(
-                    label="B · Blue 通道",
-                    type="filepath",
-                    image_mode=None,
-                    sources=["upload", "clipboard"],
-                    height=170,
-                )
-
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        a_input = gr.Image(
-                            label="A · Alpha 通道",
+                        r_input = gr.Image(
+                            label="R · Red 通道",
+                            type="filepath",
+                            # 必须为 None：Gradio 5 默认 "RGB"，会在服务端先把 16-bit 图转成
+                            # 8-bit RGB（>255 直接截断成纯白），原始位深数据就丢失了。
+                            image_mode=None,
+                            sources=["upload", "clipboard"],
+                            height=170,
+                        )
+                        g_input = gr.Image(
+                            label="G · Green 通道",
                             type="filepath",
                             image_mode=None,
                             sources=["upload", "clipboard"],
-                            height=150,
+                            height=170,
                         )
-                    with gr.Column(scale=2):
-                        alpha_mode = gr.Radio(
-                            choices=[ALPHA_UPLOAD, ALPHA_CONSTANT],
-                            value=ALPHA_UPLOAD,
-                            label="Alpha 来源",
-                        )
-                        alpha_value = gr.Slider(
-                            minimum=0,
-                            maximum=255,
-                            step=1,
-                            value=255,
-                            label="常量 Alpha（255 = 完全不透明）",
-                            visible=False,
+                        b_input = gr.Image(
+                            label="B · Blue 通道",
+                            type="filepath",
+                            image_mode=None,
+                            sources=["upload", "clipboard"],
+                            height=170,
                         )
 
-                gr.HTML("<div class='section-title'>Output · 输出设置</div>")
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                a_input = gr.Image(
+                                    label="A · Alpha 通道",
+                                    type="filepath",
+                                    image_mode=None,
+                                    sources=["upload", "clipboard"],
+                                    height=150,
+                                )
+                            with gr.Column(scale=2):
+                                alpha_mode = gr.Radio(
+                                    choices=[ALPHA_UPLOAD, ALPHA_CONSTANT],
+                                    value=ALPHA_UPLOAD,
+                                    label="Alpha 来源",
+                                )
+                                alpha_value = gr.Slider(
+                                    minimum=0,
+                                    maximum=255,
+                                    step=1,
+                                    value=255,
+                                    label="常量 Alpha（255 = 完全不透明）",
+                                    visible=False,
+                                )
 
-                with gr.Row():
-                    width = gr.Number(
-                        value=DEFAULT_SIZE, precision=0, label="宽度 Width", minimum=1,
-                        maximum=16384,
-                    )
-                    height = gr.Number(
-                        value=DEFAULT_SIZE, precision=0, label="高度 Height", minimum=1,
-                        maximum=16384,
-                    )
+                        with gr.Accordion(
+                            "通道池 · 选择已拆分的单通道灰度图直接填入槽位",
+                            open=True,
+                        ):
+                            gr.HTML(
+                                "<div class='status-wait'>列表来自 "
+                                f"<code>{OUTPUT_DIR.name}/</code> 目录（③ 通道拆分导出的 "
+                                "<code>&lt;名字&gt;_split/&lt;名字&gt;_R|G|B|A.png</code> 会出现在这里）。"
+                                "选择某项即把它接进对应的 R/G/B/A 槽位；选「（不使用）」清空该槽位。<br>"
+                                "默认<b>只列最新一次拆分的通道</b>，历史拆分不会混进列表；"
+                                "需要时点「清理历史拆分文件夹」把旧目录从磁盘删掉。</div>"
+                            )
+                            with gr.Row():
+                                pool_refresh = gr.Button("刷新列表", size="sm")
+                                pool_match = gr.Button("自动匹配最新一套 _R/_G/_B/_A", size="sm")
+                                pool_purge = gr.Button("清理历史拆分文件夹", size="sm")
+                            pool_scope = gr.Radio(
+                                choices=POOL_SCOPE_CHOICES,
+                                value="latest_split",
+                                label="列表范围",
+                            )
+                            with gr.Row():
+                                pick_r = gr.Dropdown(label="→ R 槽位", choices=[], value=None,
+                                                     allow_custom_value=False, scale=1)
+                                pick_g = gr.Dropdown(label="→ G 槽位", choices=[], value=None,
+                                                     allow_custom_value=False, scale=1)
+                                pick_b = gr.Dropdown(label="→ B 槽位", choices=[], value=None,
+                                                     allow_custom_value=False, scale=1)
+                                pick_a = gr.Dropdown(label="→ A 槽位", choices=[], value=None,
+                                                     allow_custom_value=False, scale=1)
+                            pool_status = gr.HTML("", elem_classes="status")
 
-                size_preset = gr.Dropdown(
-                    choices=[
-                        "512 × 512", "1024 × 1024", "2048 × 2048", "4096 × 4096",
-                        "1024 × 512", "512 × 1024", "2048 × 1024", "1920 × 1080",
-                    ],
-                    value=None,
-                    label="尺寸预设（选中即填入宽高）",
-                    allow_custom_value=False,
-                )
+                        gr.HTML("<div class='section-title'>Output · 输出设置</div>")
 
-                resize_mode = gr.Dropdown(
-                    choices=[(label, key) for key, label in RESIZE_MODE_LABELS.items()],
-                    value="stretch",
-                    label="缩放模式 Resize Mode",
-                )
+                        with gr.Row():
+                            width = gr.Number(
+                                value=DEFAULT_SIZE, precision=0, label="宽度 Width", minimum=1,
+                                maximum=16384,
+                            )
+                            height = gr.Number(
+                                value=DEFAULT_SIZE, precision=0, label="高度 Height", minimum=1,
+                                maximum=16384,
+                            )
 
-                with gr.Row():
-                    invert_alpha = gr.Checkbox(value=False, label="Alpha 反转")
-                    invert_rgb = gr.Checkbox(value=False, label="RGB 反转")
-
-                high_bitdepth = gr.Dropdown(
-                    choices=[
-                        (label, key) for key, label in HIGH_BITDEPTH_LABELS.items()
-                    ],
-                    value="scale",
-                    label="16 / 32-bit 位深换算",
-                    info="16-bit 灰度贴图不再被截断成纯白；蒙版只用了部分量程时选「实际范围拉伸」",
-                )
-
-                compress_level = gr.Slider(
-                    minimum=0, maximum=9, step=1, value=6,
-                    label="PNG 压缩等级（0 最快 / 9 最小，均无损）",
-                )
-
-                archive = gr.Checkbox(
-                    value=True, label=f"同时归档到 {OUTPUT_DIR.name}/ 目录",
-                )
-
-                with gr.Row():
-                    generate_button = gr.Button(
-                        "生成 PNG", variant="primary", elem_classes="generate-btn",
-                    )
-                    clear_button = gr.Button("清空重置")
-
-                download_file = gr.File(label="PNG 下载", interactive=False)
-                status = gr.HTML(
-                    "<div class='status-wait'>● 四个通道均为空 · 全部按 0 填充</div>",
-                    elem_classes="status",
-                )
-
-            # ============================ 右：预览 ============================
-            with gr.Column(scale=6):
-
-                gr.HTML("<div class='section-title'>Channel Preview · 通道预览</div>")
-
-                with gr.Row():
-                    with gr.Column(elem_classes="preview-card"):
-                        r_preview = gr.Image(
-                            label="R", height=190, interactive=False, format="png",
-                            show_download_button=False, show_fullscreen_button=True,
-                        )
-                    with gr.Column(elem_classes="preview-card"):
-                        g_preview = gr.Image(
-                            label="G", height=190, interactive=False, format="png",
-                            show_download_button=False, show_fullscreen_button=True,
-                        )
-                with gr.Row():
-                    with gr.Column(elem_classes="preview-card"):
-                        b_preview = gr.Image(
-                            label="B", height=190, interactive=False, format="png",
-                            show_download_button=False, show_fullscreen_button=True,
-                        )
-                    with gr.Column(elem_classes="preview-card"):
-                        a_preview = gr.Image(
-                            label="Alpha", height=190, interactive=False, format="png",
-                            show_download_button=False, show_fullscreen_button=True,
+                        size_preset = gr.Dropdown(
+                            choices=[
+                                "512 × 512", "1024 × 1024", "2048 × 2048", "4096 × 4096",
+                                "1024 × 512", "512 × 1024", "2048 × 1024", "1920 × 1080",
+                            ],
+                            value=None,
+                            label="尺寸预设（选中即填入宽高）",
+                            allow_custom_value=False,
                         )
 
-                gr.HTML("<div class='section-title'>RGBA Output · 合成结果</div>")
+                        resize_mode = gr.Dropdown(
+                            choices=[(label, key) for key, label in RESIZE_MODE_LABELS.items()],
+                            value="stretch",
+                            label="缩放模式 Resize Mode",
+                        )
 
-                with gr.Column(elem_classes=["preview-card", "checkerboard"]):
-                    rgba_preview = gr.Image(
-                        label="最终 RGBA（棋盘格 = 透明区域）",
-                        height=430,
-                        interactive=False,
-                        format="png",
-                        show_download_button=False,
-                        show_fullscreen_button=True,
-                    )
+                        with gr.Row():
+                            invert_alpha = gr.Checkbox(value=False, label="Alpha 反转")
+                            invert_rgb = gr.Checkbox(value=False, label="RGB 反转")
 
-                with gr.Column(elem_classes=["preview-card", "checkerboard"]):
-                    rgba_detail = gr.Image(
-                        label=f"1:1 细节预览（中心 {DETAIL_SIZE}×{DETAIL_SIZE} 原始像素，不缩放）",
-                        height=DETAIL_SIZE + 40,
-                        interactive=False,
-                        format="png",
-                        show_download_button=False,
-                        show_fullscreen_button=True,
-                    )
+                        high_bitdepth = gr.Dropdown(
+                            choices=[
+                                (label, key) for key, label in HIGH_BITDEPTH_LABELS.items()
+                            ],
+                            value="scale",
+                            label="16 / 32-bit 位深换算",
+                            info="16-bit 灰度贴图不再被截断成纯白；蒙版只用了部分量程时选「实际范围拉伸」",
+                        )
 
-                info = gr.HTML(
-                    "<div class='status-wait'>通道信息将在合成后显示</div>",
-                    elem_classes="status",
-                )
+                        compress_level = gr.Slider(
+                            minimum=0, maximum=9, step=1, value=6,
+                            label="PNG 压缩等级（0 最快 / 9 最小，均无损）",
+                        )
+
+                        archive = gr.Checkbox(
+                            value=True, label=f"同时归档到 {OUTPUT_DIR.name}/ 目录",
+                        )
+
+                        with gr.Row():
+                            generate_button = gr.Button(
+                                "生成 PNG", variant="primary", elem_classes="generate-btn",
+                            )
+                            clear_button = gr.Button("清空重置")
+
+                        download_file = gr.File(label="PNG 下载", interactive=False)
+                        status = gr.HTML(
+                            "<div class='status-wait'>● 四个通道均为空 · 全部按 0 填充</div>",
+                            elem_classes="status",
+                        )
+
+                    # ============================ 右：预览 ============================
+                    with gr.Column(scale=6):
+
+                        gr.HTML("<div class='section-title'>Channel Preview · 通道预览</div>")
+
+                        with gr.Row():
+                            with gr.Column(elem_classes="preview-card"):
+                                r_preview = gr.Image(
+                                    label="R", height=190, interactive=False, format="png",
+                                    show_download_button=False, show_fullscreen_button=True,
+                                )
+                            with gr.Column(elem_classes="preview-card"):
+                                g_preview = gr.Image(
+                                    label="G", height=190, interactive=False, format="png",
+                                    show_download_button=False, show_fullscreen_button=True,
+                                )
+                        with gr.Row():
+                            with gr.Column(elem_classes="preview-card"):
+                                b_preview = gr.Image(
+                                    label="B", height=190, interactive=False, format="png",
+                                    show_download_button=False, show_fullscreen_button=True,
+                                )
+                            with gr.Column(elem_classes="preview-card"):
+                                a_preview = gr.Image(
+                                    label="Alpha", height=190, interactive=False, format="png",
+                                    show_download_button=False, show_fullscreen_button=True,
+                                )
+
+                        gr.HTML("<div class='section-title'>RGBA Output · 合成结果</div>")
+
+                        with gr.Column(elem_classes=["preview-card", "checkerboard"]):
+                            rgba_preview = gr.Image(
+                                label="最终 RGBA（棋盘格 = 透明区域）",
+                                height=430,
+                                interactive=False,
+                                format="png",
+                                show_download_button=False,
+                                show_fullscreen_button=True,
+                            )
+
+                        with gr.Column(elem_classes=["preview-card", "checkerboard"]):
+                            rgba_detail = gr.Image(
+                                label=f"1:1 细节预览（中心 {DETAIL_SIZE}×{DETAIL_SIZE} 原始像素，不缩放）",
+                                height=DETAIL_SIZE + 40,
+                                interactive=False,
+                                format="png",
+                                show_download_button=False,
+                                show_fullscreen_button=True,
+                            )
+
+                        info = gr.HTML(
+                            "<div class='status-wait'>通道信息将在合成后显示</div>",
+                            elem_classes="status",
+                        )
+
+            build_mosaic_tab()
+            splitter_refs = build_splitter_tab(
+                composer_images=[r_input, g_input, b_input, a_input],
+                composer_pickers=[pick_r, pick_g, pick_b, pick_a],
+            )
 
         gr.HTML(
             "<div class='footer-note'>"
@@ -613,6 +712,179 @@ def build_app() -> gr.Blocks:
             outputs=[width, height],
             show_progress="hidden",
         )
+
+        # ---------------- 通道池：把已拆分的单通道图接进 R/G/B/A 槽位 ----------------
+
+        pool_pickers = [pick_r, pick_g, pick_b, pick_a]
+        pool_slot_images = [r_input, g_input, b_input, a_input]
+
+        def bind_pool_picker(picker, target):
+            """选中通道池条目 -> 填入对应槽位 -> 刷新预览。"""
+            def fill(path):
+                return gr.update(value=path)
+
+            try:
+                event = picker.change(
+                    fn=fill, inputs=picker, outputs=target,
+                    show_progress="hidden", trigger_mode="always_last",
+                )
+            except TypeError:
+                event = picker.change(
+                    fn=fill, inputs=picker, outputs=target, show_progress="hidden",
+                )
+            event.then(
+                fn=live_preview, inputs=preview_inputs, outputs=preview_outputs,
+                show_progress="hidden",
+            )
+
+        for picker, target in zip(pool_pickers, pool_slot_images, strict=True):
+            bind_pool_picker(picker, target)
+
+        def _pool_note(scope, prefix=""):
+            """生成通道池状态文案。"""
+            scope = scope or "latest_split"
+            choices = channel_pool_choices(scope)
+            newest = latest_split_dir(OUTPUT_DIR)
+            if choices:
+                head = f"{prefix}通道池：{len(choices)} 项"
+                if scope == "latest_split" and newest is not None:
+                    head += f"（最新拆分：{newest.name}）"
+                return f"<div class='status-ok'>{head}</div>", choices
+            if scope == "latest_split":
+                empty = (
+                    "<div class='status-wait'>还没有拆分结果：先到 ③ 通道拆分导出一张图的 R/G/B/A；"
+                    "想看到 output/ 里的历史图片，把「列表范围」切到「列出全部图片」</div>"
+                )
+                return empty, choices
+            empty_all = (
+                f"<div class='status-wait'>通道池为空：把图片放进 {OUTPUT_DIR.name}/ 目录后点「刷新列表」</div>"
+            )
+            return empty_all, choices
+
+        def refresh_pool(scope):
+            """刷新列表：默认只保留最新一次拆分的通道，历史条目不再出现。"""
+            note, choices = _pool_note(scope or "latest_split")
+            return [gr.update(choices=choices) for _ in pool_pickers] + [note]
+
+        def purge_history(scope):
+            """把历史拆分目录从磁盘删除，只留最新那套，然后刷新列表。"""
+            result = prune_split_dirs(OUTPUT_DIR, keep=1)
+            removed = result["removed"]
+            if removed:
+                freed = result["freed"] / 1024 / 1024
+                prefix = (
+                    f"已清理 {len(removed)} 个历史拆分目录（释放 {freed:.1f} MB），"
+                    f"保留 {result['kept']} · "
+                )
+            elif result["kept"]:
+                prefix = f"没有可清理的历史拆分目录，保留 {result['kept']} · "
+            else:
+                prefix = "还没有拆分目录 · "
+            note, choices = _pool_note(scope or "latest_split", prefix=prefix)
+            return [gr.update(choices=choices) for _ in pool_pickers] + [note]
+
+        pool_refresh.click(
+            fn=refresh_pool,
+            inputs=[pool_scope],
+            outputs=[*pool_pickers, pool_status],
+            show_progress="hidden",
+        )
+
+        pool_scope.change(
+            fn=refresh_pool,
+            inputs=[pool_scope],
+            outputs=[*pool_pickers, pool_status],
+            show_progress="hidden",
+        )
+
+        pool_purge.click(
+            fn=purge_history,
+            inputs=[pool_scope],
+            outputs=[*pool_pickers, pool_status],
+            show_progress="hidden",
+        )
+
+        def match_latest(scope):
+            """自动挑出最新的一套 _R/_G/_B/_A 并填入四个槽位。"""
+            scope = scope or "latest_split"
+            choices = channel_pool_choices(scope)
+            updates = [gr.update(choices=choices) for _ in pool_pickers]
+            matched = match_channel_set()
+            if not matched:
+                empty_note = (
+                    "<div class='status-wait'>没找到配套的 _R/_G/_B/_A（需要同一目录下四个文件），"
+                    "可以在 ③ 通道拆分里先拆一张图</div>"
+                )
+                return [
+                    *updates,
+                    gr.update(), gr.update(), gr.update(), gr.update(),
+                    empty_note,
+                ]
+
+            for slot in ("R", "G", "B", "A"):
+                path = matched.get(slot)
+                updates.append(gr.update(value=path) if path else gr.update())
+            updates.append(
+                "<div class='status-ok'>已自动匹配：" +
+                " / ".join(Path(p).name for p in matched.values()) + "</div>"
+            )
+            return updates
+
+        pool_match.click(
+            fn=match_latest,
+            inputs=[pool_scope],
+            outputs=[*pool_pickers, *pool_slot_images, pool_status],
+            show_progress="hidden",
+        ).then(
+            fn=live_preview, inputs=preview_inputs, outputs=preview_outputs,
+            show_progress="hidden",
+        )
+
+        demo.load(
+            fn=refresh_pool,
+            inputs=[pool_scope],
+            outputs=[*pool_pickers, pool_status],
+            show_progress="hidden",
+        )
+
+        # ③ 拆分面板的「送入 ① 通道合成」：填槽位 + 刷新通道池 + 刷新预览
+        if splitter_refs.get("split_event") is not None:
+            # 每次拆分完成后刷新通道池：默认只列最新那一套，历史条目自动从列表消失
+            splitter_refs["split_event"].then(
+                fn=refresh_pool,
+                inputs=[pool_scope],
+                outputs=[*pool_pickers, pool_status],
+                show_progress="hidden",
+            )
+
+        if splitter_refs.get("send_button") is not None:
+            def send_split_to_composer(file_r, file_g, file_b, file_a, scope):
+                paths = [p for p in (file_r, file_g, file_b, file_a) if p][:4]
+                choices = channel_pool_choices(scope or "latest_split")
+                image_updates = [gr.update(value=p) for p in paths]
+                image_updates += [gr.update()] * (4 - len(image_updates))
+                picker_updates = [
+                    gr.update(choices=choices, value=paths[i] if i < len(paths) else None)
+                    for i in range(4)
+                ]
+                if not paths:
+                    note = "<div class='status-wait'>还没有拆分结果，先在 ③ 里拆分一张图</div>"
+                else:
+                    note = (
+                        "<div class='status-ok'>已送入 ① 通道合成：" +
+                        " / ".join(Path(p).name for p in paths) + "</div>"
+                    )
+                return (*image_updates, *picker_updates, note)
+
+            splitter_refs["send_button"].click(
+                fn=send_split_to_composer,
+                inputs=[*splitter_refs["files"], pool_scope],
+                outputs=[*pool_slot_images, *pool_pickers, pool_status],
+                show_progress="hidden",
+            ).then(
+                fn=live_preview, inputs=preview_inputs, outputs=preview_outputs,
+                show_progress="hidden",
+            )
 
         generate_event_inputs = preview_inputs + [compress_level, archive]
         generate_button.click(
