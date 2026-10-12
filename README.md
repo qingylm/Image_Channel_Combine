@@ -1,7 +1,5 @@
 # Image_Channel_Combine
 
-Create a PNG image by mapping a grayscale image to the RGBA channels
-
 一个基于 **Python + Gradio + Pillow** 的本地网页图片通道工具：把若干张灰度图 / 蒙版装进 **R / G / B / A** 四个通道，
 合成为一张 **RGBA PNG**；也能反过来把一张图片**拆分成四个通道**。
 
