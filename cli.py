@@ -20,6 +20,10 @@ cli.py
     # 四宫格拼图：四张 2048x2048 -> 一张 2048x2048（每块 1024x1024，各自保留 RGBA）
     python cli.py --mosaic --tl a.png --tr b.png --bl c.png --br d.png
 
+    # CubeMap：六张等大正方形 -> 一张横向十字展开图（4x3）
+    python cli.py --cubemap --right px.png --left nx.png --top py.png \\
+        --bottom ny.png --front pz.png --back nz.png --layout cross_h
+
     # 保持比例裁剪，并反转 Alpha
     python cli.py --r R.png --g G.png --b B.png --a A.png --size 2048x2048 --mode crop --invert-alpha
 """
@@ -31,10 +35,12 @@ import sys
 from pathlib import Path
 
 from image_processor import (
+    CUBEMAP_LAYOUTS,
     HIGH_BITDEPTH_MODES,
     RESIZE_MODES,
     ChannelError,
     combine_to_png,
+    cubemap_atlas,
     mosaic_quadrants,
     output_file_name,
     pack_same_size,
@@ -114,7 +120,52 @@ def build_parser():
     parser.add_argument("--tr", default=None, help="拼图模式：右上图片")
     parser.add_argument("--bl", default=None, help="拼图模式：左下图片")
     parser.add_argument("--br", default=None, help="拼图模式：右下图片")
+
+    # ---- CubeMap 模式 ----
+    parser.add_argument(
+        "--cubemap", action="store_true",
+        help="CubeMap 模式：把 --right/--left/--top/--bottom/--front/--back 六张等大正方形图合成一张展开图",
+    )
+    parser.add_argument("--right", default=None, help="CubeMap：+X 右面")
+    parser.add_argument("--left", default=None, help="CubeMap：-X 左面")
+    parser.add_argument("--top", default=None, help="CubeMap：+Y 上面")
+    parser.add_argument("--bottom", default=None, help="CubeMap：-Y 下面")
+    parser.add_argument("--front", default=None, help="CubeMap：+Z 前面")
+    parser.add_argument("--back", default=None, help="CubeMap：-Z 后面")
+    parser.add_argument(
+        "--layout", choices=CUBEMAP_LAYOUTS, default="cross_h",
+        help="CubeMap 排列：cross_h 横向十字（默认，4×3） / cross_v 纵向十字（3×4） / "
+             "strip_h 横条（6×1） / strip_v 竖条（1×6）",
+    )
     return parser
+
+
+def run_cubemap(args) -> int:
+    """CubeMap：六张等大正方形图 -> 一张展开图。"""
+    report: list[str] = []
+    face_size = args.size[0] if args.size else None
+    try:
+        atlas, size, face = cubemap_atlas(
+            right_path=args.right, left_path=args.left, top_path=args.top,
+            bottom_path=args.bottom, front_path=args.front, back_path=args.back,
+            face_size=face_size,
+            layout=args.layout,
+            tile_mode=args.mode,
+            high_bitdepth=args.depth,
+            size_report=report,
+        )
+    except ChannelError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    output = args.output or Path("output") / output_file_name(size[0], size[1], prefix="cubemap")
+    saved = save_png(atlas, output, compress_level=args.compress)
+
+    print(f"[完成] CubeMap {size[0]}x{size[1]}（每面 {face}x{face}，{args.layout}）-> {saved}")
+    for line in report:
+        print(f"       {line}")
+    print(f"[信息] 文件大小 {Path(saved).stat().st_size / 1024:.1f} KB")
+    return 0
 
 
 def run_mosaic(args) -> int:
@@ -177,6 +228,9 @@ def main(argv=None):
 
     if args.mosaic:
         return run_mosaic(args)
+
+    if args.cubemap:
+        return run_cubemap(args)
 
     auto_size = args.size is None
     try:

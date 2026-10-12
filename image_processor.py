@@ -938,6 +938,179 @@ def prune_split_dirs(output_dir=None, keep: int = 1) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 工具 D：CubeMap 立方体贴图（六张等大正方形图 -> 一张展开图）
+# ---------------------------------------------------------------------------
+
+# 六个面（沿用 Unity / 常规 cubemap 命名）
+CUBEMAP_FACES = ("right", "left", "top", "bottom", "front", "back")
+
+CUBEMAP_FACE_LABELS = {
+    "right": "+X 右 Right",
+    "left": "-X 左 Left",
+    "top": "+Y 上 Top",
+    "bottom": "-Y 下 Bottom",
+    "front": "+Z 前 Front",
+    "back": "-Z 后 Back",
+}
+
+# 排列方式：每种布局的网格尺寸 + 每个面所在的 (列, 行)
+CUBEMAP_LAYOUTS = ("cross_h", "cross_v", "strip_h", "strip_v")
+
+CUBEMAP_LAYOUT_LABELS = {
+    "cross_h": "横向十字（4 × 3，Unity / 常规十字展开）",
+    "cross_v": "纵向十字（3 × 4）",
+    "strip_h": "横向条带（6 × 1，顺序 +X -X +Y -Y +Z -Z）",
+    "strip_v": "纵向条带（1 × 6，顺序 +X -X +Y -Y +Z -Z）",
+}
+
+CUBEMAP_LAYOUT_GRID = {
+    "cross_h": (4, 3),
+    "cross_v": (3, 4),
+    "strip_h": (6, 1),
+    "strip_v": (1, 6),
+}
+
+CUBEMAP_LAYOUT_CELLS = {
+    "cross_h": {
+        "top": (1, 0),
+        "left": (0, 1), "front": (1, 1), "right": (2, 1), "back": (3, 1),
+        "bottom": (1, 2),
+    },
+    "cross_v": {
+        "top": (1, 0),
+        "left": (0, 1), "front": (1, 1), "right": (2, 1),
+        "bottom": (1, 2),
+        "back": (1, 3),
+    },
+    "strip_h": {
+        "right": (0, 0), "left": (1, 0), "top": (2, 0),
+        "bottom": (3, 0), "front": (4, 0), "back": (5, 0),
+    },
+    "strip_v": {
+        "right": (0, 0), "left": (0, 1), "top": (0, 2),
+        "bottom": (0, 3), "front": (0, 4), "back": (0, 5),
+    },
+}
+
+
+def cubemap_atlas(
+    *,
+    right_path=None,
+    left_path=None,
+    top_path=None,
+    bottom_path=None,
+    front_path=None,
+    back_path=None,
+    face_size: int | None = None,
+    layout: str = "cross_h",
+    tile_mode: str = "stretch",
+    high_bitdepth: str = "scale",
+    size_report: list[str] | None = None,
+) -> tuple[Image.Image, tuple[int, int], int]:
+    """六张等大正方形图 -> 一张 CubeMap 展开图（每张各自保留 RGBA）。
+
+    默认横向十字布局（4 × 3）：
+
+        ┌──────┬──────┬──────┬──────┐
+        │      │ +Y 上 │      │      │
+        ├──────┼──────┼──────┼──────┤
+        │ -X 左 │ +Z 前 │ +X 右 │ -Z 后 │
+        ├──────┼──────┼──────┼──────┤
+        │      │ -Y 下 │      │      │
+        └──────┴──────┴──────┴──────┘
+
+    Args:
+        right_path / left_path / top_path / bottom_path / front_path / back_path:
+            六个面的图片（+X / -X / +Y / -Y / +Z / -Z）；为空的格子保持透明。
+        face_size: 每个面的边长；为 None 时自动取「第一张提供的图」的尺寸
+            （非正方形则取短边，并在报告里说明）。
+        layout: "cross_h" | "cross_v" | "strip_h" | "strip_v"。
+        tile_mode: 每个面如何适配格子，"stretch" | "fit" | "crop"。
+        high_bitdepth: 16/32-bit 位深换算方式。
+        size_report: 可选，追加每个面的说明。
+
+    Returns:
+        (atlas, (width, height), face_size)
+    """
+    if layout not in CUBEMAP_LAYOUTS:
+        raise ChannelError(
+            f"未知的 CubeMap 排列方式：{layout}（可选：{', '.join(CUBEMAP_LAYOUTS)}）"
+        )
+    if tile_mode not in RESIZE_MODES:
+        raise ChannelError(
+            f"未知的每面适配方式：{tile_mode}（可选：{', '.join(RESIZE_MODES)}）"
+        )
+
+    faces = {
+        "right": right_path,
+        "left": left_path,
+        "top": top_path,
+        "bottom": bottom_path,
+        "front": front_path,
+        "back": back_path,
+    }
+    provided = [(key, path) for key, path in faces.items() if path]
+    if not provided:
+        raise ChannelError("至少上传一个面（建议六张都给全）")
+
+    if face_size is None:
+        info = probe_image_info(provided[0][1])
+        width, height = info["size"]
+        face_size = min(width, height)
+        if size_report is not None and width != height:
+            size_report.append(
+                f"提示：基准图不是正方形（{width}×{height}），已按短边 {face_size} 作为每面尺寸"
+            )
+    face_size = int(face_size)
+    if face_size < 1:
+        raise ChannelError("每面尺寸必须大于 0")
+
+    cols, rows = CUBEMAP_LAYOUT_GRID[layout]
+    out_w, out_h = cols * face_size, rows * face_size
+    if out_w > 16384 or out_h > 16384:
+        raise ChannelError(
+            f"展开图会变成 {out_w}×{out_h}，单边超过 16384；请减小每面尺寸"
+        )
+
+    cells = CUBEMAP_LAYOUT_CELLS[layout]
+    atlas = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+
+    for face in CUBEMAP_FACES:
+        label = CUBEMAP_FACE_LABELS[face]
+        col, row = cells[face]
+        position = (col * face_size, row * face_size)
+        path = faces[face]
+
+        if not path:
+            if size_report is not None:
+                size_report.append(f"{label}: 空 · 保持透明")
+            continue
+
+        info = probe_image_info(path)
+        source_rgba = _load_rgba(path, high_bitdepth)
+        tile = _fit_rgba_into(source_rgba, face_size, face_size, tile_mode)
+        atlas.paste(tile, position)
+
+        if size_report is not None:
+            note = (
+                "1:1 放置" if info["size"] == (face_size, face_size)
+                else f"缩放到 {face_size}×{face_size}"
+            )
+            size_report.append(
+                f"{label}: {info['width']}×{info['height']} {info['mode']} → "
+                f"第 {col + 1} 列第 {row + 1} 行（{tile_mode} · {note}）"
+            )
+
+    if size_report is not None:
+        size_report.append(
+            f"输出: {out_w}×{out_h} RGBA · 排列 {CUBEMAP_LAYOUT_LABELS[layout]} · "
+            f"每面 {face_size}×{face_size}"
+        )
+
+    return atlas, (out_w, out_h), face_size
+
+
 def zip_files(files, zip_path) -> str:
     """把若干文件打包成 ZIP，返回 ZIP 路径。"""
     zip_path = Path(zip_path)

@@ -19,9 +19,11 @@ from pathlib import Path
 import gradio as gr
 
 from image_processor import (
+    CUBEMAP_LAYOUT_LABELS,
     DEFAULT_OUTPUT_DIR,
     HIGH_BITDEPTH_LABELS,
     ChannelError,
+    cubemap_atlas,
     mosaic_quadrants,
     output_file_name,
     save_channel_png,
@@ -509,3 +511,286 @@ def build_splitter_tab(composer_images=None, composer_pickers=None):
         "files": split_files,
         "split_event": split_event,
     }
+
+
+# ---------------------------------------------------------------------------
+# ④ CubeMap 立方体贴图（六张等大正方形 -> 一张展开图）
+# ---------------------------------------------------------------------------
+
+CUBE_SIZE_AUTO = "自动（= 第一张图的尺寸）"
+CUBE_SIZE_MANUAL = "手动指定"
+
+# 面板里上传框的排列顺序（沿用条带顺序 +X -X +Y -Y +Z -Z）
+CUBE_FACE_FIELDS = [
+    ("right", "① +X 右 Right"),
+    ("left", "② -X 左 Left"),
+    ("top", "③ +Y 上 Top"),
+    ("bottom", "④ -Y 下 Bottom"),
+    ("front", "⑤ +Z 前 Front"),
+    ("back", "⑥ -Z 后 Back"),
+]
+
+CUBEMAP_LAYOUT_CHOICES = [
+    (label, key) for key, label in CUBEMAP_LAYOUT_LABELS.items()
+]
+
+
+def _cube_kwargs(files, face_size, layout, tile_mode, high_bitdepth, report=None):
+    """把六个上传框的值整理成 cubemap_atlas 的关键字参数。"""
+    kwargs = {f"{face}_path": files.get(face) for face, _ in CUBE_FACE_FIELDS}
+    kwargs.update(
+        face_size=face_size,
+        layout=layout or "cross_h",
+        tile_mode=tile_mode or "stretch",
+        high_bitdepth=high_bitdepth or "scale",
+    )
+    if report is not None:
+        kwargs["size_report"] = report
+    return kwargs
+
+
+def cubemap_preview(
+    right_file,
+    left_file,
+    top_file,
+    bottom_file,
+    front_file,
+    back_file,
+    size_mode,
+    face_size,
+    layout,
+    tile_mode,
+    high_bitdepth,
+):
+    """实时预览：六张图 -> 一张 CubeMap 展开图。"""
+    auto = size_mode == CUBE_SIZE_AUTO
+    files = dict(zip(
+        ("right", "left", "top", "bottom", "front", "back"),
+        (right_file, left_file, top_file, bottom_file, front_file, back_file),
+        strict=True,
+    ))
+    try:
+        atlas, size, face = cubemap_atlas(
+            **_cube_kwargs(
+                files,
+                None if auto else face_size,
+                layout, tile_mode, high_bitdepth,
+            )
+        )
+    except ChannelError as exc:
+        return None, None, _err(str(exc)), ""
+    except Exception as exc:  # noqa: BLE001 - UI 边界统一转成状态提示
+        return None, None, _err(f"合成失败：{exc}"), ""
+
+    return (
+        atlas,
+        _center_crop(atlas, 256),
+        _ok(
+            f"● CubeMap 预览就绪 · 展开图 {size[0]} × {size[1]} px · 每面 {face} × {face} px · "
+            f"{'自动每面尺寸' if auto else '手动每面尺寸'}"
+        ),
+        "",
+    )
+
+
+def cubemap_generate(
+    right_file,
+    left_file,
+    top_file,
+    bottom_file,
+    front_file,
+    back_file,
+    size_mode,
+    face_size,
+    layout,
+    tile_mode,
+    high_bitdepth,
+    compress_level,
+    archive,
+):
+    """生成 CubeMap PNG 供下载。"""
+    auto = size_mode == CUBE_SIZE_AUTO
+    report: list[str] = []
+    files = dict(zip(
+        ("right", "left", "top", "bottom", "front", "back"),
+        (right_file, left_file, top_file, bottom_file, front_file, back_file),
+        strict=True,
+    ))
+    try:
+        atlas, size, face = cubemap_atlas(
+            **_cube_kwargs(
+                files,
+                None if auto else face_size,
+                layout, tile_mode, high_bitdepth,
+                report=report,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - 统一抛给 Gradio 展示
+        raise gr.Error(f"合成失败：{exc}")
+
+    file_name = output_file_name(size[0], size[1], prefix="cubemap")
+    temp_dir = Path(tempfile.mkdtemp(prefix="rgba-cubemap-"))
+    saved = save_png(atlas, temp_dir / file_name, compress_level=int(compress_level))
+
+    notes = [
+        f"已生成 {file_name}（{size[0]} × {size[1]} RGBA）",
+        f"排列：{CUBEMAP_LAYOUT_LABELS.get(layout, layout)} · 每面 {face} × {face}",
+    ]
+    if archive:
+        try:
+            save_png(atlas, OUTPUT_DIR / file_name, compress_level=int(compress_level))
+            notes.append(f"已归档：{OUTPUT_DIR / file_name}")
+            saved = str((OUTPUT_DIR / file_name).resolve())
+        except Exception as exc:  # noqa: BLE001 - 归档失败不影响下载
+            notes.append(f"归档失败（不影响下载）：{exc}")
+
+    return saved, _ok("<br>".join(html.escape(n) for n in notes)), _report_html(report)
+
+
+def build_cubemap_tab():
+    """构建「CubeMap 立方体贴图」面板。"""
+    with gr.Tab("④ CubeMap · 六张 → 立方体贴图"):
+
+        gr.HTML(
+            "<div class='section-title'>CubeMap Atlas</div>"
+            "<div class='status-wait'>上传 <b>六张等大正方形图</b>（+X / -X / +Y / -Y / +Z / -Z），"
+            "每张各自保留 RGBA，合成一张标准的 <b>CubeMap 展开图</b>。<br>"
+            "默认横向十字（4×3）：六张 2048×2048 → 一张 8192×6144；"
+            "也可以输出横/竖条带（6×1 / 1×6），或纵向十字（3×4）。</div>"
+        )
+
+        with gr.Row(equal_height=False):
+
+            with gr.Column(scale=4, min_width=420, elem_classes="channel-card"):
+                gr.HTML("<div class='section-title'>输入 · 六个面</div>")
+
+                cube_inputs = {}
+                for row_start in (0, 3):
+                    with gr.Row():
+                        for index in range(row_start, row_start + 3):
+                            face, label = CUBE_FACE_FIELDS[index]
+                            with gr.Column():
+                                cube_inputs[face] = gr.Image(
+                                    label=label, type="filepath", image_mode=None,
+                                    sources=["upload", "clipboard"], height=120,
+                                )
+
+                gr.HTML("<div class='section-title'>CubeMap 设置</div>")
+
+                cube_size_mode = gr.Radio(
+                    choices=[CUBE_SIZE_AUTO, CUBE_SIZE_MANUAL],
+                    value=CUBE_SIZE_AUTO,
+                    label="每面尺寸",
+                    info="自动 = 第一张图的尺寸（六张 2048 → 每面 2048 → 横向十字 8192×6144）",
+                )
+                with gr.Row(visible=False) as cube_manual_row:
+                    cube_face_size = gr.Number(
+                        value=1024, precision=0, minimum=1, maximum=4096,
+                        label="每面边长（像素）",
+                    )
+
+                cube_layout = gr.Dropdown(
+                    choices=CUBEMAP_LAYOUT_CHOICES, value="cross_h",
+                    label="排列方式 Layout",
+                )
+                cube_tile_mode = gr.Dropdown(
+                    choices=TILE_MODE_CHOICES, value="stretch",
+                    label="每面适配方式",
+                    info="源图与面格子比例一致（都是正方形）时，三种方式结果相同",
+                )
+                cube_depth = gr.Dropdown(
+                    choices=BITDEPTH_CHOICES, value="scale",
+                    label="16 / 32-bit 位深换算",
+                )
+                cube_compress = gr.Slider(
+                    minimum=0, maximum=9, step=1, value=6,
+                    label="PNG 压缩等级（无损）",
+                )
+                cube_archive = gr.Checkbox(
+                    value=True, label=f"同时归档到 {OUTPUT_DIR.name}/ 目录",
+                )
+
+                with gr.Row():
+                    cube_button = gr.Button("合成 CubeMap PNG", variant="primary")
+                    cube_clear = gr.Button("清空")
+
+                cube_file = gr.File(label="CubeMap PNG 下载", interactive=False)
+                cube_status = gr.HTML(_wait("等待上传六个面（至少一张）"), elem_classes="status")
+
+            with gr.Column(scale=6):
+                gr.HTML("<div class='section-title'>CubeMap 预览</div>")
+                with gr.Column(elem_classes=["preview-card", "checkerboard"]):
+                    cube_preview_image = gr.Image(
+                        label="CubeMap 展开图（棋盘格 = 透明区域）", height=380,
+                        interactive=False, format="png",
+                        show_download_button=False, show_fullscreen_button=True,
+                    )
+                with gr.Column(elem_classes=["preview-card", "checkerboard"]):
+                    cube_detail_image = gr.Image(
+                        label="1:1 细节预览（中心 256×256）", height=290,
+                        interactive=False, format="png",
+                        show_download_button=False, show_fullscreen_button=True,
+                    )
+                cube_report = gr.HTML("", elem_classes="status")
+
+        # ---------------- 事件 ----------------
+        cube_input_list = [cube_inputs[face] for face, _ in CUBE_FACE_FIELDS]
+        cube_preview_inputs = cube_input_list + [
+            cube_size_mode, cube_face_size, cube_layout, cube_tile_mode, cube_depth,
+        ]
+        cube_preview_outputs = [
+            cube_preview_image, cube_detail_image, cube_status, cube_report,
+        ]
+
+        def cube_bind(component, event="change"):
+            listener = getattr(component, event)
+            try:
+                return listener(
+                    fn=cubemap_preview, inputs=cube_preview_inputs,
+                    outputs=cube_preview_outputs,
+                    show_progress="hidden", trigger_mode="always_last",
+                )
+            except TypeError:
+                return listener(
+                    fn=cubemap_preview, inputs=cube_preview_inputs,
+                    outputs=cube_preview_outputs, show_progress="hidden",
+                )
+
+        for component in cube_input_list:
+            cube_bind(component, "change")
+            cube_bind(component, "clear")
+        for component in (
+            cube_size_mode, cube_face_size, cube_layout, cube_tile_mode, cube_depth,
+        ):
+            cube_bind(component, "change")
+
+        cube_size_mode.change(
+            fn=lambda mode: gr.update(visible=(mode == CUBE_SIZE_MANUAL)),
+            inputs=cube_size_mode,
+            outputs=cube_manual_row,
+            show_progress="hidden",
+        )
+
+        cube_button.click(
+            fn=cubemap_generate,
+            inputs=cube_preview_inputs + [cube_compress, cube_archive],
+            outputs=[cube_file, cube_status, cube_report],
+        )
+
+        def cube_reset():
+            return (
+                None, None, None, None, None, None,
+                CUBE_SIZE_AUTO, 1024, "cross_h", "stretch", "scale",
+                6, True,
+                None, None, _wait("等待上传六个面（至少一张）"), "",
+            )
+
+        cube_clear_event = cube_clear.click(
+            fn=cube_reset,
+            inputs=None,
+            outputs=cube_preview_inputs + [cube_compress, cube_archive] + cube_preview_outputs,
+        )
+        cube_clear_event.then(
+            fn=cubemap_preview, inputs=cube_preview_inputs, outputs=cube_preview_outputs,
+            show_progress="hidden",
+        )

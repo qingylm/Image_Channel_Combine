@@ -24,7 +24,7 @@ Create a PNG image by mapping a grayscale image to the RGBA channels
 
 | 功能 | 说明 |
 | --- | --- |
-| 三个工作面板 | ① 通道合成（自定义尺寸）② 四宫格拼图（四张 → 一张 2×2）③ 通道拆分（一张 → R/G/B/A） |
+| 四个工作面板 | ① 通道合成（自定义尺寸）② 四宫格拼图（四张 → 一张 2×2）③ 通道拆分（一张 → R/G/B/A）④ CubeMap（六张 → 立方体贴图） |
 | 四通道上传 | R / G / B / A，支持拖拽、点击选择、粘贴剪贴板图片 |
 | **空通道按 0 填充** | 任一通道没上传图片时，该通道整幅按 **0** 填充（R/G/B = 黑，A = 完全透明），不阻断合成；可以只上传其中几个通道 |
 | 输出尺寸 | 宽 / 高任意设置（1 – 16384），内置常用尺寸预设；**四宫格拼图面板默认自动取第一张图的原始尺寸（每块减半）** |
@@ -36,21 +36,22 @@ Create a PNG image by mapping a grayscale image to the RGBA channels
 | 透明棋盘格 | Alpha / RGBA 预览以棋盘格表示透明区域（只画在图像本身，留白不算透明） |
 | **通道拆分导出** | 一张图拆成四个**单通道灰度 PNG**，可分别下载或一次性下载 ZIP |
 | **通道池（拆分 → 合成直连）** | ③ 拆出的通道自动进入 ① 的「通道池」，下拉选择即可接进 R/G/B/A 槽位；也可一键「送入通道合成」，**不用下载再重传**。列表默认只保留**最新一次拆分**，历史条目可一键清理 |
+| **CubeMap 合成** | 六张等大正方形图（+X / -X / +Y / -Y / +Z / -Z）各保留 RGBA，合成标准立方体贴图展开图；支持横向十字 4×3、纵向十字 3×4、横条 6×1、竖条 1×6 |
 | PNG 压缩等级 | 0（最快）– 9（最小），均无损 |
 | 下载与归档 | 生成后可下载，并自动归档到 `output/` 目录（可关闭） |
-| 命令行模式 | `cli.py` 支持四宫格拼图与通道拆分，便于批量 / 脚本调用 |
+| 命令行模式 | `cli.py` 支持四宫格拼图、通道拆分与 CubeMap，便于批量 / 脚本调用 |
 
 ---
 
-## 2. 三个工作面板
+## 2. 四个工作面板
 
-启动后网页顶部是三标签页，互不影响：
+启动后网页顶部是四标签页，互不影响：
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │  RGBA Image Composer                          v1.2.0 · Gradio       │
 ├─────────────────────────────────────────────────────────────────────┤
-│ [① 通道合成] [② 四宫格拼图] [③ 通道拆分]                             │
+│ [① 通道合成] [② 四宫格拼图] [③ 通道拆分] [④ CubeMap]                  │
 ├──────────────────────────────┬──────────────────────────────────────┤
 │  R / G / B / A 上传            │  四个通道预览                        │
 │  Alpha 来源 / 尺寸 / 缩放模式   │  RGBA 输出预览（棋盘格）              │
@@ -141,6 +142,39 @@ Create a PNG image by mapping a grayscale image to the RGBA channels
 
 > 磁盘删除只发生在你点「清理历史拆分文件夹」时；「刷新列表」本身不动任何文件。
 
+### 2.5 ④ CubeMap · 六张 → 立方体贴图
+
+上传六张**等大正方形图**（+X / -X / +Y / -Y / +Z / -Z），每张各自保留 RGBA，合成一张标准的
+**CubeMap 展开图**。默认横向十字（4 × 3，Unity / 常规十字展开）：
+
+```text
+        ┌──────┬──────┬──────┬──────┐
+        │      │ +Y 上 │      │      │          六张 2048×2048
+        ├──────┼──────┼──────┼──────┤      →   一张 8192×6144
+        │ -X 左 │ +Z 前 │ +X 右 │ -Z 后 │          （每面 2048）
+        ├──────┼──────┼──────┼──────┤
+        │      │ -Y 下 │      │      │
+        └──────┴──────┴──────┴──────┘
+```
+
+四种排列方式（下拉选择）：
+
+| layout | 网格 | 输出尺寸（每面 N） | 说明 |
+| --- | --- | --- | --- |
+| `横向十字 cross_h`（默认） | 4 × 3 | 4N × 3N | Unity / 常规十字展开 |
+| `纵向十字 cross_v` | 3 × 4 | 3N × 4N | 上面 −X/+Z/+X 一行，下面依次 −Y、−Z |
+| `横向条带 strip_h` | 6 × 1 | 6N × N | 顺序 +X −X +Y −Y +Z −Z |
+| `纵向条带 strip_v` | 1 × 6 | N × 6N | 顺序 +X −X +Y −Y +Z −Z |
+
+* 每面尺寸默认**自动 = 第一张图的尺寸**（六张 2048 → 每面 2048 → 十字 8192×6144）；也可手动指定
+* 每个面独立保留 RGBA；空格子保持**透明**；`fit` 留白同样透明
+* 支持 16-bit / 32-bit / 浮点源图（走同一套位深换算，不会截断成纯白）
+* 合成后给出报告：每个面的源尺寸 / 模式 → 所在行列、输出尺寸与排列方式
+* 16-bit 与 8-bit 混用也没问题（示例：四个 `I;16` 灰度面 + 两个 `RGBA` 面 → 2048×1536）
+
+> 注意：本工具只做**摆放**，不改变面的朝向。若你的管线使用特定约定（OpenGL / DirectX 的面向与上下翻转不同），
+> 请在导出后用目标引擎的 cubemap 导入设置校正，或先把面图旋转好再上传。
+
 ---
 
 ## 3. 项目结构
@@ -148,9 +182,9 @@ Create a PNG image by mapping a grayscale image to the RGBA channels
 ```text
 Image_Channel_Combine/
 ├── app.py                  # 主程序：三个标签页的界面与事件绑定（Gradio）
-├── ui_tools.py             # ② 四宫格拼图 / ③ 通道拆分 两个面板的 UI 与回调
+├── ui_tools.py             # ② 四宫格拼图 / ③ 通道拆分 / ④ CubeMap 面板的 UI 与回调
 ├── image_processor.py      # 核心图像处理（无 UI 依赖，可当库用 / 给 CLI 用）
-├── cli.py                  # 命令行入口：四宫格拼图 + 通道拆分
+├── cli.py                  # 命令行入口：通道打包 + 四宫格拼图 + CubeMap + 通道拆分
 ├── make_examples.py        # 生成示例通道图（examples/R|G|B|A.png）
 ├── requirements.txt        # 依赖清单
 ├── run.bat                 # Windows 双击启动脚本
@@ -246,6 +280,14 @@ python app.py --share          # 生成 Gradio 公网临时链接（注意隐私
 2. 看四个通道预览（R / G / B / A）
 3. 点「拆分并导出通道」→ 四个灰度 PNG + 一个 ZIP，并写入 `output/<图片名>_split/`
 4. 想让它们直接参与合成：点「→ 送入 ① 通道合成」，或回到 ① 用「通道池」逐个选择
+
+### 6.4 CubeMap
+
+1. 按面把六张等大正方形图拖入 `① +X 右 / ② -X 左 / ③ +Y 上 / ④ -Y 下 / ⑤ +Z 前 / ⑥ -Z 后`
+2. 每面尺寸保持「自动（= 第一张图的尺寸）」，或手动指定（例如六张 2048 想输出 8192×6144 就填 2048）
+3. 选择排列方式（默认横向十字 4×3）
+4. 右侧预览确认每个面都在正确的格子里
+5. 点「合成 CubeMap PNG」→ 下载与归档
 
 ---
 
@@ -348,6 +390,12 @@ python cli.py --r R.png --g G.png --b B.png --size 1024x1024 --alpha-const 255 -
 # 四宫格拼图：四张 2048x2048 -> 一张 2048x2048（每块 1024x1024，各自保留 RGBA）
 python cli.py --mosaic --tl a.png --tr b.png --bl c.png --br d.png
 
+# CubeMap：六张等大正方形 -> 一张展开图（默认横向十字 4x3；自动每面尺寸取第一张图）
+python cli.py --cubemap --right px.png --left nx.png --top py.png --bottom ny.png --front pz.png --back nz.png
+
+# CubeMap 横条布局 + 指定每面 1024
+python cli.py --cubemap --right px.png --left nx.png --top py.png --bottom ny.png --front pz.png --back nz.png --layout strip_h --size 1024x1024
+
 # 通道拆分：一张图 -> R/G/B/A 四个灰度 PNG + ZIP
 python cli.py --split tex.png --outdir channels/
 
@@ -370,6 +418,9 @@ python cli.py --r R.png --g G.png --b B.png --a A.png --size 2048x2048 --mode cr
 | `--outdir DIR` | 拆分模式的输出目录，省略则写入 `output/<图片名>_split/` |
 | `--mosaic` | 四宫格拼图模式：把 `--tl/--tr/--bl/--br` 四张图拼成一张 2×2 新图 |
 | `--tl / --tr / --bl / --br` | 拼图模式的左上 / 右上 / 左下 / 右下图片；可只给其中几张，空格子保持透明 |
+| `--cubemap` | CubeMap 模式：把 `--right/--left/--top/--bottom/--front/--back` 六张等大正方形图合成一张展开图 |
+| `--right / --left / --top / --bottom / --front / --back` | CubeMap 的六个面（+X / -X / +Y / -Y / +Z / -Z）；空格子保持透明 |
+| `--layout cross_h\|cross_v\|strip_h\|strip_v` | CubeMap 排列，默认 `cross_h`（4×3 十字）；`--size WxH` 指定每面边长（取 W，需为正方形） |
 
 ---
 
@@ -382,6 +433,7 @@ from image_processor import (
     process_channels,      # 四通道 -> RGBA（可指定尺寸、缩放模式）
     pack_same_size,        # 四张同尺寸 -> 一张同尺寸（通道打包，自动尺寸、1:1）
     mosaic_quadrants,      # 四张图各自保留 RGBA -> 一张 2×2 新图（左上/右上/左下/右下）
+    cubemap_atlas,         # 六张等大正方形 -> 一张 CubeMap 展开图（十字 / 条带）
     split_channels,        # 一张 -> R/G/B/A 四个 8-bit 通道
     combine_to_png,        # 一步写盘
     save_png,              # 保存 RGBA PNG
@@ -422,7 +474,20 @@ atlas, size = mosaic_quadrants(
 )
 save_png(atlas, "out/mosaic.png")
 
-# 4) 通道拆分
+# 4) CubeMap：六张等大正方形 -> 一张展开图
+report = []
+cube, size, face = cubemap_atlas(
+    right_path="px.png", left_path="nx.png", top_path="py.png",
+    bottom_path="ny.png", front_path="pz.png", back_path="nz.png",
+    face_size=None,                     # None = 自动取第一张图的尺寸
+    layout="cross_h",                   # cross_h | cross_v | strip_h | strip_v
+    tile_mode="stretch",
+    high_bitdepth="scale",
+    size_report=report,
+)
+save_png(cube, "out/cubemap.png")
+
+# 5) 通道拆分
 r, g, b, a, info = split_channels("tex.png", high_bitdepth="scale")
 for label, channel in zip("RGBA", (r, g, b, a)):
     save_channel_png(channel, f"out/tex_{label}.png")
@@ -499,6 +564,14 @@ A：通道本身就是单通道数据。导出为 `L` 模式灰度 PNG 体积更
 
 **Q：原图没有 Alpha，拆分出的 A 是什么？**
 A：255（完全不透明），状态栏标注「无（按 255 不透明合成）」。
+
+**Q：CubeMap 输出的展开图能在 Unity / Unreal 里直接用吗？**
+A：默认的横向十字（4×3）就是 Unity 与多数工具的 cubemap 展开格式，导入时需要在该引擎里指定为 cubemap / 十字布局。
+本工具只做摆放，不改朝向：如果你的管线对某个面有上下/左右翻转的约定，请先旋转好面图再上传（或导入后在引擎里校正）。
+
+**Q：六张 2048² 做 CubeMap 会输出多大？**
+A：横向十字 = 8192×6144（每面 2048）。内存里是 RGBA 约 200 MB，一般机器可处理；
+如果想小一点，把「每面尺寸」改成手动并填 1024 → 输出 4096×3072。单边超过 16384 会被拒绝并提示减小每面尺寸。
 
 **Q：拆分出的通道，怎么直接用在 ① 通道合成里？**
 A：两种方式（见 2.4）：③ 里点「→ 送入 ① 通道合成」一步接好四个槽位；

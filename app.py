@@ -40,7 +40,7 @@ from image_processor import (
     prune_split_dirs,
     save_png,
 )
-from ui_tools import build_mosaic_tab, build_splitter_tab
+from ui_tools import build_cubemap_tab, build_mosaic_tab, build_splitter_tab
 
 APP_VERSION = "1.2.0"
 DEFAULT_SIZE = 1024
@@ -643,6 +643,7 @@ def build_app() -> gr.Blocks:
                 composer_images=[r_input, g_input, b_input, a_input],
                 composer_pickers=[pick_r, pick_g, pick_b, pick_a],
             )
+            build_cubemap_tab()
 
         gr.HTML(
             "<div class='footer-note'>"
